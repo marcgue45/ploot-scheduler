@@ -37,7 +37,7 @@ export async function insertEvent(
  * Un Embajador no es elegible si: está pausado (429 / token revocado), su throttle propio no ha
  * vencido, ya tiene un post en vuelo, o su cabeza está en backoff (no se adelanta la cola).
  */
-const CANDIDATES_SQL = `
+export const CANDIDATES_SQL = `
 WITH due_ambassadors AS (
   SELECT DISTINCT ambassador_id
   FROM posts
@@ -75,6 +75,9 @@ LIMIT $1`;
  */
 export async function claimBatch(pool: Pool, o: ClaimOptions): Promise<ClaimedPost[]> {
   return withTx(pool, async (c) => {
+    // Medido (A.2.3): el arranque de workers paralelos costaba más que la query (52 ms -> 22 ms).
+    // Además acorta el tiempo que se retiene la fila del bucket de app (hot row).
+    await c.query("SET LOCAL max_parallel_workers_per_gather = 0");
     const bucket = await c.query(
       `SELECT least(capacity, tokens + refill_per_sec * extract(epoch FROM now() - updated_at)) AS available,
               coalesce(paused_until > now(), false) AS paused
@@ -132,7 +135,7 @@ export async function reapExpiredLeases(pool: Pool, maxAttempts: number, actor: 
        )
        UPDATE posts p
        SET attempts = p.attempts + 1,
-           status = CASE WHEN p.attempts + 1 >= $1 THEN 'failed'::post_status ELSE 'scheduled'::post_status END,
+           status = CASE WHEN p.attempts + 1 >= $1 THEN 'failed' ELSE 'scheduled' END,
            run_at = now(),
            last_error_code = CASE WHEN p.attempts + 1 >= $1 THEN 'MAX_ATTEMPTS_EXCEEDED' ELSE 'LEASE_EXPIRED' END,
            last_error_message = 'lease caducado (worker ' || coalesce(expired.locked_by, '?') || ' caído o colgado)',

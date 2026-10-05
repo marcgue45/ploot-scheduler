@@ -257,7 +257,7 @@ export async function listPosts(auth: AuthContext, params: URLSearchParams) {
     // Keyset pagination sobre (created_at, id): estable y O(limit) aunque el tenant tenga 5M filas.
     const res = await c.query(
       `SELECT ${POST_COLUMNS} FROM posts p JOIN ambassadors a ON a.id = p.ambassador_id
-       WHERE ($1::post_status IS NULL OR p.status = $1)
+       WHERE ($1::text IS NULL OR p.status = $1)
          AND ($2::timestamp IS NULL OR (p.created_at, p.id) < ($2::timestamp AT TIME ZONE 'UTC', $3::uuid))
        ORDER BY p.created_at DESC, p.id DESC
        LIMIT $4`,

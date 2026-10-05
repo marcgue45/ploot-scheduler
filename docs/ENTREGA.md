@@ -111,7 +111,23 @@ flowchart LR
   ORDER BY rn, scheduled_at LIMIT $n;
   -- después: UPDATE ... FROM (SELECT id ... FOR UPDATE SKIP LOCKED) -> 'publishing'
   ```
-- **`EXPLAIN` esperado.** `Limit → Sort (rn, scheduled_at) → WindowAgg → Nested Loop → HashAggregate (Index Scan posts_due_run_at_idx) → Index Scan ambassadors_pkey → Limit → Index Scan posts_ambassador_head_idx`. El coste es O(Embajadores con trabajo vencido) y no depende de que un tenant tenga 5M filas históricas.
+- **`EXPLAIN (ANALYZE, BUFFERS)` real.** Medido con `scripts/explain-claim.ts`, que importa la query exacta del worker, sobre `db/bench/seed_5m.sql`:
+  - **Dataset:** 5,5M posts. El tenant grande (BigCorp) tiene 5,0M: 4,9M publicados, 90k programados a 90 días y 2.500 vencidos. Hay 1.000 tenants más y 3.504 posts vencidos (pico de las 09:00).
+  - **Plan resultante:**
+    ```
+    Limit → Sort top-N (rn, scheduled_at) → WindowAgg → Sort (tenant_id, scheduled_at)
+      → Nested Loop
+          → Hash Join (ambassadors elegibles ⋈ Embajadores con trabajo vencido)
+              → Hash Anti Join: Seq Scan ambassadors (5.050) ⋉ Index Only Scan posts_one_inflight_per_ambassador
+              → Unique → Bitmap Index Scan posts_due_run_at_idx   (3.504 filas, 6 buffers)
+          → Limit 1 → Index Scan posts_ambassador_head_idx        (1.054 loops, ~0,003 ms cada uno)
+    Execution Time: 22–24 ms   ·   Buffers: shared hit≈4.300
+    ```
+  - **Lectura del plan:** el coste es O(Embajadores con trabajo vencido) = 1.054 sondas de índice, y **no depende de los 5M de histórico**, que no entran en ningún índice parcial.
+  - **Hallazgos de la medición** (aplicados al código):
+    1. **Paralelismo innecesario.** Postgres lanzaba 2 workers paralelos cuyo arranque costaba más que la query: 52 ms → **22 ms** con `SET LOCAL max_parallel_workers_per_gather = 0` en la tx del claim. Además, acorta el tiempo que se retiene la fila del bucket de app.
+    2. **RLS + enum no *leakproof*.** El listado de la API filtrado por un estado raro (`status=failed`) en BigCorp tardaba **1.212 ms**, recorriendo los 5M de filas, frente a 0,07 ms sin RLS. La causa: `enum_eq` no es *leakproof*, así que Postgres no puede usar el predicado del usuario como condición de índice junto a la política RLS. Migración `002`: `status` pasa a `text + CHECK` (`texteq` sí es leakproof) → **0,066 ms**, con `Index Cond: (tenant_id = … AND status = 'failed')`.
+    3. **Límite conocido.** `status=published` (98 % del tenant) tarda 49 ms: el planner prefiere el índice `(tenant_id, created_at)` y descarta ~90k programados más recientes. Es un error de estimación por correlación entre columnas; está muy por debajo del p95 de 4 s y no lo toco.
 - **Conexiones desde la app.** Cada instancia serverless usa la URL de **PgBouncer** (transaction mode) con `max: 2`. PgBouncer acepta hasta 1000 clientes y los multiplexa sobre 70 conexiones reales.
 - **Implicaciones del transaction mode.** No hay estado de sesión: el tenant se fija con `set_config('app.tenant_id', $1, true)` (equivalente a `SET LOCAL`) dentro de la tx, y no se usan advisory locks de sesión ni `LISTEN`. Con los prepared statements, usamos `pg` con sentencias sin nombre, que no tienen problema (además, el PgBouncer gestionado tiene `max_prepared_statements=300`). Prisma necesitaría `pgbouncer=true`.
 - **Conexiones del worker.** El worker, de larga vida, va **directo** por red privada, sin pooler, con un pool fijo de 5 por réplica. Las migraciones también van directas, porque usan un advisory lock de sesión.
