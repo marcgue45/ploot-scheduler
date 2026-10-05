@@ -2,8 +2,15 @@
   "name": "ploot-scheduler",
   "private": true,
   "type": "module",
-  "workspaces": ["shared", "app", "worker", "mock"],
-  "engines": { "node": ">=20.9" },
+  "workspaces": [
+    "shared",
+    "app",
+    "worker",
+    "mock"
+  ],
+  "engines": {
+    "node": ">=20.9"
+  },
   "scripts": {
     "db:migrate": "tsx scripts/migrate.ts",
     "db:seed": "tsx scripts/seed.ts",
@@ -12,7 +19,8 @@
     "worker": "tsx worker/src/main.ts",
     "mock": "tsx mock/src/server.ts",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "app": "node app-standalone/app/server.js"
   },
   "dependencies": {
     "tsx": "^4.23.0"

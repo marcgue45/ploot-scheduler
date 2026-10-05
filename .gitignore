@@ -9,3 +9,5 @@ next-env.d.ts
 .railway/
 # Enunciado de la prueba (no se publica)
 /*.pdf
+.vercel
+.env*

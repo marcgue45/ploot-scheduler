@@ -1,7 +1,10 @@
 # Entorno LOCAL. Los valores por defecto son de desarrollo y no protegen nada real;
 # en el despliegue público todo llega por variables de entorno del host.
+# Imagen precompilada por CI (GHCR): arranque en < 60 s sin compilar Next.js.
+# Sin red / para probar cambios locales: `docker compose up --build`.
 x-image: &image
-  image: ploot-scheduler:local
+  image: ghcr.io/marcgue45/ploot-scheduler:latest
+  pull_policy: missing
   build: .
 
 x-common-env: &common-env
@@ -60,11 +63,12 @@ services:
 
   app:
     <<: *image
-    command: npm run start -w @ploot/app -- -p 3000
+    command: npm run app
     environment:
       <<: *common-env
       DATABASE_URL: postgres://ploot_app:app_local_pw@postgres:5432/ploot
       DEMO_MODE: "true"
+      PORT: "3000"
     ports: ["3000:3000"]
     depends_on:
       migrate: { condition: service_completed_successfully }
