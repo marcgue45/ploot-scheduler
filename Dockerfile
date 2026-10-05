@@ -11,3 +11,6 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build -w @ploot/app
 USER node
+# En Railway cada servicio fija APP_ROLE (worker | mock); compose sobrescribe con `command`.
+ENV APP_ROLE=worker
+CMD ["sh", "-c", "exec npm run \"$APP_ROLE\""]
