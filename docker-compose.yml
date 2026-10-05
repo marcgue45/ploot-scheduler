@@ -1,0 +1,75 @@
+# Entorno LOCAL. Los valores por defecto son de desarrollo y no protegen nada real;
+# en el despliegue público todo llega por variables de entorno del host.
+# Imagen precompilada por CI (GHCR): arranque en < 60 s sin compilar Next.js.
+# Sin red / para probar cambios locales: `docker compose up --build`.
+x-image: &image
+  image: ghcr.io/marcgue45/ploot-scheduler:latest
+  pull_policy: missing
+  build: .
+
+x-common-env: &common-env
+  TOKEN_ENC_KEY: ${TOKEN_ENC_KEY:-bG9jYWwtZGV2LW9ubHkta2V5LW5vdC1hLXNlY3JldCE=}
+  JWT_SECRET: ${JWT_SECRET:-local-dev-only-jwt-secret-not-for-production}
+  LOG_LEVEL: info
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ploot
+    ports: ["${PG_HOST_PORT:-5432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ploot"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *image
+    command: npm run db:setup
+    environment:
+      <<: *common-env
+      DATABASE_ADMIN_URL: postgres://postgres:postgres@postgres:5432/ploot
+      APP_DB_PASSWORD: app_local_pw
+      WORKER_DB_PASSWORD: worker_local_pw
+      SEED_MODE: ${SEED_MODE:-if-empty}
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  mock:
+    <<: *image
+    command: npm run mock
+    environment:
+      PORT: "4000"
+      MOCK_LATENCY_MAX_MS: ${MOCK_LATENCY_MAX_MS:-3000}
+      MOCK_5XX_RATE: ${MOCK_5XX_RATE:-0.15}
+      MOCK_429_RATE: ${MOCK_429_RATE:-0.1}
+    ports: ["4000:4000"]
+
+  worker:
+    <<: *image
+    command: npm run worker
+    environment:
+      <<: *common-env
+      WORKER_DATABASE_URL: postgres://ploot_worker:worker_local_pw@postgres:5432/ploot
+      PROVIDER_URL: http://mock:4000
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      mock: { condition: service_started }
+    restart: unless-stopped
+
+  app:
+    <<: *image
+    command: npm run app
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgres://ploot_app:app_local_pw@postgres:5432/ploot
+      DEMO_MODE: "true"
+      PORT: "3000"
+    ports: ["3000:3000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
