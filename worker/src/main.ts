@@ -1,6 +1,7 @@
 import { hostname } from "node:os";
 import { createLogger, createPool } from "@ploot/shared";
 import { claimBatch, reapExpiredLeases } from "./claim";
+import { purgeIdempotencyKeys } from "./maintenance";
 import { loadConfig } from "./config";
 import { processPost, type WorkerDeps } from "./process";
 import { ProviderClient } from "./provider";
@@ -75,11 +76,18 @@ async function main() {
       .catch((err) => log.error({ err }, "reaper failed"));
   }, 5_000);
   const stats = setInterval(() => logQueueStats(deps).catch((err) => log.error({ err }, "stats failed")), 15_000);
+  const idemTtlHours = Number(process.env.IDEMPOTENCY_TTL_HOURS ?? 24);
+  const purge = setInterval(() => {
+    purgeIdempotencyKeys(pool, idemTtlHours)
+      .then((n) => n > 0 && log.info({ purged: n, ttl_hours: idemTtlHours }, "purged expired idempotency keys"))
+      .catch((err) => log.error({ err }, "idempotency purge failed"));
+  }, 10 * 60_000);
 
   log.info({ config: { ...config } }, "worker started");
   await runWorker(deps, () => running);
   clearInterval(reaper);
   clearInterval(stats);
+  clearInterval(purge);
   await pool.end();
   log.info("worker stopped cleanly");
 }

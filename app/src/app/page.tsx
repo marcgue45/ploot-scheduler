@@ -32,6 +32,7 @@ export default function Page() {
   const [token, setToken] = useState("");
   const [posts, setPosts] = useState<Post[]>([]);
   const [diag, setDiag] = useState<any>(null);
+  const [dlq, setDlq] = useState<any[]>([]);
   const [msg, setMsg] = useState("");
   const [content, setContent] = useState("");
   const [local, setLocal] = useState("");
@@ -55,6 +56,8 @@ export default function Page() {
     if (!token) return;
     const r = await api("/api/v1/posts?limit=50");
     if (r.ok) setPosts((await r.json()).items);
+    const dl = await api("/api/v1/dead-letters");
+    if (dl.ok) setDlq((await dl.json()).items);
     if (current) {
       const d = await api(`/api/v1/ambassadors/${current.profile_id}`);
       if (d.ok) setDiag(await d.json());
@@ -82,6 +85,13 @@ export default function Page() {
     const r = await api(`/api/v1/posts/${id}/publish`, { method: "POST", headers: { "idempotency-key": crypto.randomUUID() } });
     const j = await r.json();
     setMsg(r.ok ? `Publicación encolada (${r.status})` : `Error ${r.status}: ${j.error?.code}`);
+    refresh();
+  }
+
+  async function replay(id: number) {
+    const r = await api(`/api/v1/dead-letters/${id}/replay`, { method: "POST" });
+    const j = await r.json();
+    setMsg(r.ok ? "Reencolado desde la DLQ" : `Error ${r.status}: ${j.error?.code} — ${j.error?.message}`);
     refresh();
   }
 
@@ -117,6 +127,20 @@ export default function Page() {
         <section style={{ background: "#fff", border: "1px solid #ddd", padding: 10, marginBottom: 12, fontSize: 13 }}>
           <b>¿Por qué va atrasado {diag.ambassador.display_name}?</b> token: {diag.token.status} · vencidos: {diag.queue.due} · en vuelo: {diag.queue.in_flight} · lag: {diag.queue.lag_seconds}s
           <ul style={{ margin: "4px 0" }}>{diag.diagnosis.map((d: string) => <li key={d}>{d}</li>)}</ul>
+        </section>
+      )}
+
+      {dlq.length > 0 && (
+        <section style={{ background: "#fff5f5", border: "1px solid #f3c4c4", padding: 10, marginBottom: 12, fontSize: 13 }}>
+          <b>DLQ del tenant ({dlq.length})</b>
+          <ul style={{ margin: "4px 0" }}>
+            {dlq.map((d) => (
+              <li key={d.id}>
+                <code>{d.error_code}</code> {d.error_message} · {d.attempts} intentos · post {String(d.post_id).slice(0, 8)}{" "}
+                <button onClick={() => replay(d.id)}>Reprocesar</button>
+              </li>
+            ))}
+          </ul>
         </section>
       )}
 
