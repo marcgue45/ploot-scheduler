@@ -250,3 +250,87 @@ Mitigación: secretos marcados como *sensitive*/sellados, scopes por entorno, ca
 3. **Certificación SOC 2 / ISO 27001.** Cuesta meses de proceso y 20–50k € de auditoría. Aplicamos las prácticas sin la auditoría hasta que un deal enterprise la exija.
 
 Diferirlos es correcto porque el riesgo residual es bajo, hay controles compensatorios y para un equipo pequeño cada uno cuesta semanas que hoy deben ir al producto.
+
+---
+
+## D. Operaciones — D.1: 429 masivo + conexiones agotadas a las 09:00
+
+**Lectura del escenario.** Son dos incidentes simultáneos que hay que separar antes de actuar:
+
+1. **El proveedor nos frena (429).** Es riesgo de ban, irreversible, y por eso es la prioridad.
+2. **La API se ahoga por conexiones.** Es degradación, recuperable.
+
+En nuestro diseño están **desacoplados**:
+
+- La API no llama al proveedor: `publish` solo encola y devuelve 202.
+- La app pasa por PgBouncer.
+- El worker usa sus propias conexiones directas.
+
+Por eso, si coinciden, hay que buscar una causa común a las 09:00, no asumirla.
+
+### Detección (minuto 0–2)
+
+- **Pagina** `app_paused` > 5 min, es decir, el circuit breaker de app abierto por 429 con `scope=app`.
+- **Pagina** conexiones de BD > 90 % o cola de PgBouncer creciendo, con el p95 de la API por encima de 4 s.
+- **Llega después** el lag de publicación (`oldest_due_lag_s` en `queue_stats`) > 10 min.
+- **Si los 429 fueran por usuario y no de app,** la señal sería `paused_ambassadors` disparado, no `app_paused`. Distinguirlo es el primer paso del diagnóstico.
+
+### Diagnóstico (minuto 2–8)
+
+Las señales son síntomas; antes de tocar nada se confirman las causas.
+
+- **¿Qué 429 son?** En los logs del worker (`outcome=rate_limited`) se mira la proporción `scope=app` frente a `scope=user` y los `Retry-After`.
+- **¿Obedece el worker?** Con `app_paused` activo no debería salir ninguna petición al proveedor. Si salen, es un bug: se escala a 0 réplicas.
+- **¿La app usa el pooler?** Se comprueba que el `DATABASE_URL` de Vercel apunta a PgBouncer y no a Postgres directo. Se tarda 30 s y, si está mal, es la causa raíz del problema de conexiones.
+- **¿Quién retiene las conexiones?**
+  - `pg_stat_activity` agrupado por `application_name`/`usename` (`ploot-app` frente a `ploot-worker`).
+  - `SHOW POOLS` en PgBouncer, para ver los clientes en espera (`cl_waiting`).
+  - Los logs de la API por ruta y duración. Sospechoso habitual: **tormenta de polling** de miles de Embajadores mirando a las 09:00 si su post salió.
+
+### Mitigación (minuto 5–20)
+
+**Objetivo 1: cero riesgo de ban.**
+
+- La pausa de app ya está activa: el bucket queda a 0 fichas y nadie publica hasta `Retry-After`. **No se toca la cola**: un post esperando en `scheduled` no gasta cuota ni arriesga cuentas. Lo peligroso eran los reintentos, y ya están parados.
+- **Reapertura gradual.** Al acabar la pausa, el bucket se rellena desde 0 a su ritmo (2/s), así que la cola sale en rampa, respetando el cap global, el intervalo por Embajador y el reparto por turnos entre tenants. Si los 429 vuelven, se baja `refill_per_sec` en la fila `rate_buckets` sin redesplegar.
+
+**Objetivo 2: recuperar la API.**
+
+1. Si el `DATABASE_URL` no apunta al pooler, se corrige y se redespliega (rollback instantáneo de Vercel si vino de un deploy).
+2. Se frena la tormenta de polling con una regla del Vercel Firewall que limita `GET /api/v1/posts` por IP o token, y se sube el intervalo de polling de la UI.
+3. Se cancelan en Postgres las queries que superen N segundos (`pg_cancel_backend`) y se fija un `statement_timeout` para el rol `ploot_app`.
+
+**Lo que NO se hace, aunque sea tentador:**
+
+- **Escalar workers para vaciar la cola.** No aumenta el ritmo, porque el bucket es compartido y el cap global es fijo. Además, cada worker abre 5 conexiones directas y empeora el otro incidente.
+- **Subir el pool de PgBouncer a 500.** Traslada el cuello de botella a Postgres: más procesos, más memoria y más latencia para todos, también el worker.
+- **Mandar la cola a la DLQ.** Convertiría posts sanos en `failed`, es difícil de deshacer y obliga a reprocesar a mano.
+- **Reintentar a mano.** Es exactamente el retry-storm que provoca el ban.
+
+**Comunicación.** Se publica un aviso en la página de estado ("publicaciones de las 09:00 con retraso, ninguna cuenta en riesgo"). En la UI, el porqué ya es visible por post (`APP_RATE_LIMITED`, `Retry-After`).
+
+### Método de root cause (después del incidente)
+
+- **Línea temporal reconstruida** con:
+  - `post_events`, que da cada transición con su hora y actor;
+  - los logs del worker, con cada 429, su `scope` y `Retry-After`, y el `trace_id` por post;
+  - `queue_stats` cada 15 s;
+  - los logs de la API por ruta y latencia;
+  - las estadísticas de PgBouncer.
+- **Primera pregunta:** ¿qué llegó primero, el pico de conexiones o los 429? ¿Hubo un deploy antes de las 09:00?
+- **Cierre:** postmortem *blameless* con "5 porqués" sobre la causa común (concentración de todo el producto en un mismo minuto) y las acciones con dueño y fecha.
+
+### Follow-up
+
+**Producto:**
+
+- **Franjas concurridas.** Al programar, si la franja está saturada, se avisa al Embajador ("las 09:00 están muy concurridas; puede salir con unos minutos de retraso") y puede elegir otra hora. Internamente, "09:00" se publica repartido entre 09:00 y 09:10 con jitter: para el usuario es natural y para el proveedor deja de ser una ráfaga.
+- **Retraso máximo.** Si un post supera X minutos de retraso (configurable por tenant, por ejemplo 60 min), no sale sin más: pasa a "necesita decisión" y se pregunta al Embajador si publicar ahora, reprogramar o editar. Un post sobre "esta mañana" puede no tener sentido a las 11:00.
+
+**Sistema:**
+
+- **Circuit breaker *half-open* explícito.** Al acabar `Retry-After`, una sola petición de prueba antes de abrir la rampa.
+- **Bucket por tenant** (pendiente en la tabla de decisiones), para que el presupuesto de un tenant no dependa de los demás.
+- **Polling con backoff en la UI**, o SSE, y `Cache-Control` corto en los listados.
+- **`statement_timeout` por rol** y alerta de `cl_waiting` en PgBouncer.
+- **Conocer el límite real.** Calibrar `refill_per_sec` contra los límites publicados del proveedor y alertar al 70 % de consumo del bucket, no al 429.
