@@ -334,3 +334,49 @@ Las señales son síntomas; antes de tocar nada se confirman las causas.
 - **Polling con backoff en la UI**, o SSE, y `Cache-Control` corto en los listados.
 - **`statement_timeout` por rol** y alerta de `cl_waiting` en PgBouncer.
 - **Conocer el límite real.** Calibrar `refill_per_sec` contra los límites publicados del proveedor y alertar al 70 % de consumo del bucket, no al 429.
+
+---
+
+## E. Qué hice y por qué + visión de producto
+
+### E.1 — Tabla de decisiones
+
+| # | Componente / decisión | Qué hice | Por qué (alternativa descartada + su coste) | Estado | Próximo paso |
+|---|---|---|---|---|---|
+| 1 | Locking del worker | `FOR UPDATE SKIP LOCKED` sobre `posts` en una tx corta, con claim por lotes, lease (`lease_until`), reaper y fencing token (`claim_id`) | BullMQ + Redis: segunda fuente de verdad y otra pieza HA. SQS: delay máximo de 15 min (no cubre 90 días) y *dual write* | Hecho (test N réplicas + crash + zombi) | — |
+| 2 | Exactly-once ante crash | `Idempotency-Key = post.id` hacia el proveedor (el mock deduplica) | Estado `unknown` + reconciliación manual: más lento y con intervención humana. Asunción declarada: el proveedor acepta la clave | Hecho | — |
+| 3 | Aislamiento de tenant | RLS (`ENABLE` + `FORCE`), `tenant_id DEFAULT app_current_tenant()`, rol `ploot_app` sin `BYPASSRLS`, `GRANT` por columna en credenciales | `WHERE tenant_id` en una capa repositorio: un solo olvido rompe el aislamiento y no es "a nivel SQL" | Hecho (test SQL + API) | — |
+| 4 | `status` text + CHECK | Migración 002 tras medir | ENUM: `enum_eq` no es leakproof y, con RLS, el índice no se usa (1.212 ms → 0,066 ms) | Hecho | — |
+| 5 | Gobernador de rate limit | Bucket de app en Postgres + cap global + 1 en vuelo por Embajador (índice único) + intervalo con jitter + pausa `Retry-After` + round-robin por tenant | Redis + Lua: otra pieza; a 5k cabe en Postgres. Coste: la fila del bucket serializa los claims (~22 ms) | Parcial | Bucket por tenant con cuota según plan |
+| 6 | Pooling | PgBouncer (transaction mode) para Vercel; worker y migraciones directos | Sin pooler: N instancias agotan `max_connections`. Pooler también para el worker: pierde la sesión y no aporta | Hecho | — |
+| 7 | Hosting | Vercel `fra1` + Railway `europe-west4` (lo diseñado = lo desplegado) | AWS (Fargate + KMS): identidad de workload, pero más piezas y no es lo desplegado | Hecho | Migrar worker + claves a AWS ante una exigencia enterprise |
+| 8 | Tokens OAuth | AES-256-GCM con AAD; refresh *just-in-time*; revocado → `TOKEN_REVOKED` sin reintentos y Embajador bloqueado | KMS desde Railway: necesitaría una clave IAM estática. Fallar todos los posts del Embajador: obliga a reprogramar | Parcial | DEK por Embajador; refresh proactivo; flujo de reconexión |
+| 9 | Taxonomía de errores | Espera (429) / transitorio (5xx, timeout: backoff con jitter, máx. 5) / permanente (`failed` + DLQ) | Reintentar todo igual: quema intentos en 429 y retry-storm | Hecho | — |
+| 10 | DLQ | `dead_letters` + `GET/POST /dead-letters/:id/replay` (una vez, auditado; no reprocesa revocados) | Solo `failed` sin replay: reprocesar a mano por SQL | Hecho | — |
+| 11 | Idempotencia de la API | `idempotency_keys` en la misma tx; replay de la respuesta; purga a 24 h | Caché en memoria: no sobrevive a N instancias serverless | Hecho | — |
+| 12 | "Publicar ahora" | Asíncrono (202), lo publica el worker | Síncrono: rompe el p95 < 4 s y se salta el gobernador | Hecho | Webhook/SSE de resultado |
+| 13 | DST | Hora local + zona → UTC; inexistente → 422; ambigua → primera | Desplazar en silencio: el post sale a una hora no elegida | Hecho (tests Europe/Madrid) | — |
+| 14 | Observabilidad | Logs JSON con IDs, `post_events`, `GET /ambassadors/:id` con diagnóstico, `queue_stats` | Solo logs: hay que saber buscar | Parcial | OTel con spans reales y métricas |
+| 15 | Rendimiento medido | Dataset de 5,5M + `EXPLAIN ANALYZE` de la query real; claim sin paralelismo (52 → 22 ms) | Plan "esperado" sin medir | Hecho | — |
+| 16 | `docker compose` < 60 s | Imagen multi-stage (363 MB) publicada en GHCR por CI; `build` como alternativa | Build local de Next: ~100 s | Hecho | — |
+| 17 | Auth de demo | JWT HS256 + `/api/demo/tokens` con `DEMO_MODE` | IdP real + RS256/JWKS: fuera de alcance | Hecho (declarado) | IdP; quitar el endpoint |
+| 18 | CI/CD | GitHub Actions: typecheck, 28 tests con Postgres, gitleaks, imagen | — | Parcial | Aprobación manual + rollback automático (B.2) |
+| 19 | Media / object storage | Solo en el diseño (R2 UE) | — | No hecho | URL presignada + borrado GDPR |
+
+### E.2 — La métrica que define si Ploot funciona
+
+**Reuniones cualificadas por Embajador al mes atribuibles a su actividad en Ploot.** Un Embajador no publica por publicar: le dedica tiempo y expone su marca personal, y la única recompensa que justifica ese coste es que su presencia genere conversaciones que acaben en reunión. Impresiones, likes o posts publicados son métricas de vanidad: pueden subir sin que nada importante pase. Si cada lunes ve "este mes, 3 reuniones salieron de conversaciones que empezaron con tus posts", sabe si Ploot le sirve.
+
+**Instrumentación sobre las Partes A–C.**
+- Cada publicación ya deja `external_id`, Embajador, tenant y hora en `posts`/`post_events`.
+- Las interacciones que trae el proveedor (comentarios, mensajes, visitas al perfil) se ligan al `external_id`. Esas son las señales que recibe el Cazador.
+- Cuando el Cazador marca una señal como "reunión agendada" (o se detecta vía integración de calendario/CRM), se crea un evento `meeting_booked` con la cadena `post → interacción → señal → reunión`.
+- La métrica es un agregado semanal por Embajador: atribución al primer toque dentro de una ventana de 30 días.
+
+**Dónde aparece.** En la home del Embajador, como primer número de su resumen semanal ("3 reuniones este mes, 1 más que el anterior"), con el desglose de qué posts las originaron. También en el email de los lunes. El cliente que paga ve el agregado por equipo, pero la métrica se diseña para el Embajador: si él no la ve, deja de publicar y todo lo demás deja de existir.
+
+### Declaración de herramientas de IA
+
+- **Claude Code (Anthropic):** scaffolding, la mayor parte del código y de los tests, despliegue vía CLI (Vercel, Railway, GitHub) y primeros borradores del texto de A–E. Los commits llevan `Co-Authored-By: Claude`.
+- **Mi papel:** decidir alcance y orden (A/B antes que C), infraestructura (Vercel + Railway, PgBouncer, que lo diseñado sea lo desplegado), pedir la medición real del `EXPLAIN` y elegir sus fixes (`status` a text, claim sin paralelismo), validar o posponer cada decisión de la tabla (bucket por tenant como siguiente paso; replay de DLQ y purga de claves implementados) y aportar el enfoque de D.1 y E.2.
+- **Verificación:** 28 tests de integración contra Postgres real, despliegue probado end-to-end en la URL pública y CI en verde con escaneo de secretos.
