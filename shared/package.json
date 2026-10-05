@@ -1,0 +1,14 @@
+{
+  "name": "@ploot/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "jose": "^6.2.0",
+    "luxon": "^3.7.0",
+    "pg": "^8.23.0",
+    "pino": "^10.4.0"
+  }
+}

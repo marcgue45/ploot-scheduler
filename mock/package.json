@@ -1,0 +1,7 @@
+{
+  "name": "@ploot/mock",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "tsx src/server.ts" }
+}
